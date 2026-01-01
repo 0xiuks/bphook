@@ -1,0 +1,9 @@
+Package: com.0xiuks.bphook
+Name: bphook
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: bphook
+Maintainer: 0xiuks
+Author: xiu
+Section: Tweaks
+
