@@ -1,4 +1,5 @@
 #include "bphook_types.h"
+#include "fishhook.h"
 #include <mach/mach.h>
 #include <mach/thread_status.h>
 #include <mach/mach_port.h>
@@ -60,6 +61,7 @@ static HardwareEntry g_hw_slots[MAX_HWBP_SLOTS];
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 static atomic_bool g_init_ok = ATOMIC_VAR_INIT(false);
+static atomic_bool g_exception_guard_installed = ATOMIC_VAR_INIT(false);
 static mach_port_t g_server_port = MACH_PORT_NULL;
 
 static __thread uint32_t g_tls_disabled_mask = 0;
@@ -85,11 +87,71 @@ static HookRegistration *find_free_hook_slot(void);
 static HardwareEntry *find_hw_slot_by_id(int id);
 static int find_free_hw_slot_index(void);
 static bool is_initialized(void);
+static void install_exception_guard_once(void);
 static bool register_hook(int id, uintptr_t target_addr,
                           hook_callback_t callback,
                           hook_mode_t mode,
                           patch_fn_t patch_fn,
                           uintptr_t resume_addr);
+
+static kern_return_t (*orig_task_set_exception_ports)(
+    task_t, exception_mask_t, mach_port_t, exception_behavior_t, thread_state_flavor_t) = NULL;
+static kern_return_t (*orig_thread_set_exception_ports)(
+    thread_act_t, exception_mask_t, mach_port_t, exception_behavior_t, thread_state_flavor_t) = NULL;
+
+static kern_return_t bphook_task_set_exception_ports(task_t task,
+                                                     exception_mask_t exception_mask,
+                                                     mach_port_t new_port,
+                                                     exception_behavior_t behavior,
+                                                     thread_state_flavor_t new_flavor) {
+    if (!orig_task_set_exception_ports) {
+        return KERN_FAILURE;
+    }
+    if (g_server_port == MACH_PORT_NULL) {
+        return orig_task_set_exception_ports(task, exception_mask, new_port, behavior, new_flavor);
+    }
+    if ((exception_mask & EXC_MASK_BREAKPOINT) && new_port != g_server_port) {
+        exception_mask &= ~EXC_MASK_BREAKPOINT;
+        if (exception_mask == 0) {
+            return KERN_SUCCESS;
+        }
+    }
+    return orig_task_set_exception_ports(task, exception_mask, new_port, behavior, new_flavor);
+}
+
+static kern_return_t bphook_thread_set_exception_ports(thread_act_t thread,
+                                                       exception_mask_t exception_mask,
+                                                       mach_port_t new_port,
+                                                       exception_behavior_t behavior,
+                                                       thread_state_flavor_t new_flavor) {
+    if (!orig_thread_set_exception_ports) {
+        return KERN_FAILURE;
+    }
+    if (g_server_port == MACH_PORT_NULL) {
+        return orig_thread_set_exception_ports(thread, exception_mask, new_port, behavior, new_flavor);
+    }
+    if ((exception_mask & EXC_MASK_BREAKPOINT) && new_port != g_server_port) {
+        exception_mask &= ~EXC_MASK_BREAKPOINT;
+        if (exception_mask == 0) {
+            return KERN_SUCCESS;
+        }
+    }
+    return orig_thread_set_exception_ports(thread, exception_mask, new_port, behavior, new_flavor);
+}
+
+static void install_exception_guard_once(void) {
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&g_exception_guard_installed, &expected, true)) {
+        return;
+    }
+    struct rebinding rebindings[] = {
+        {"task_set_exception_ports", (void *)bphook_task_set_exception_ports,
+         (void **)&orig_task_set_exception_ports},
+        {"thread_set_exception_ports", (void *)bphook_thread_set_exception_ports,
+         (void **)&orig_thread_set_exception_ports},
+    };
+    (void)rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+}
 
 static inline uintptr_t strip_pac(uintptr_t ptr) {
 #if BP_HAVE_PTRAUTH
@@ -298,6 +360,7 @@ bool BPInit(void) {
         return false;
     }
     pthread_detach(t);
+    install_exception_guard_once();
 
     atomic_store_explicit(&g_init_ok, true, memory_order_release);
     pthread_mutex_unlock(&g_init_mutex);
